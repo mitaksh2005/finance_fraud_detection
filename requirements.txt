@@ -1,0 +1,19 @@
+# Data Science Basics
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# Deep Learning
+torch>=2.0.0
+pytorch-tabnet>=4.1.0
+pytorch-tabular>=1.0.0
+
+# Imbalance & Loss
+imbalanced-learn>=0.10.0
+
+# Explainability
+shap>=0.41.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
