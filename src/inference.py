@@ -1,78 +1,114 @@
 import torch
+import lightgbm as lgb
 import pandas as pd
 import numpy as np
+import sys
+import os
 from model import MultiTaskTabNet
-import gc
+
+# Configuration
+TABNET_PATH = '../outputs/models/unified_mtl_best.pth'
+LGBM_PATH = '../outputs/models/lgbm_model.txt'
+SHARED_DIM = 50
+DEVICE = torch.device('cpu') # Inference is usually done on CPU
 
 class RiskInferenceEngine:
-    def __init__(self, model_path, input_dim, cat_dims, cat_idxs):
+    def __init__(self, input_dim=None, private_dim=None):
         """
-        Loads the trained MTL weights and prepares the Decision Engine.
+        Initializes the Hybrid Engine by loading both models.
         """
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = MultiTaskTabNet(input_dim, cat_dims, cat_idxs)
+        self.shared_dim = SHARED_DIM
         
-        # Load the saved .pth weights
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint)
-        self.model.to(self.device)
-        self.model.eval()
-        print(f"Unified Risk Model loaded successfully on {self.device}")
+        # We need dimensions to initialize TabNet. 
+        # If not provided, we assume standard dimensions from training (446 total)
+        # 446 total - 50 shared = 396 private (Example)
+        if input_dim is None: 
+            # Fallback or strict requirement. 
+            # Better to require it or infer from a dummy load if needed.
+            # For now, we will require the user to pass the feature count or instantiate lazily.
+            pass
 
-    def predict_risk(self, feature_vector):
+        self.tabnet = None
+        self.lgbm = None
+        self.models_loaded = False
+
+    def load_models(self, feature_count):
         """
-        Takes a processed feature vector and returns Credit and Fraud scores.
+        Loads models dynamically based on the input feature count.
         """
+        input_dim = self.shared_dim
+        private_dim = feature_count - self.shared_dim
+        
+        print(f"Initializing Engine with {feature_count} features ({input_dim} Shared + {private_dim} Private)...")
+
+        # 1. Load TabNet
+        try:
+            self.tabnet = MultiTaskTabNet(input_dim=input_dim, private_dim=private_dim)
+            self.tabnet.load_state_dict(torch.load(TABNET_PATH, map_location=DEVICE))
+            self.tabnet.eval()
+            print("✅ TabNet loaded successfully.")
+        except FileNotFoundError:
+            print(f"❌ Error: TabNet weights not found at {TABNET_PATH}")
+            sys.exit(1)
+        
+        # 2. Load LightGBM
+        if os.path.exists(LGBM_PATH):
+            self.lgbm = lgb.Booster(model_file=LGBM_PATH)
+            print("✅ LightGBM loaded successfully.")
+        else:
+            print(f"⚠️ Warning: LightGBM model not found at {LGBM_PATH}. Running in TabNet-only mode.")
+            self.lgbm = None
+            
+        self.models_loaded = True
+
+    def predict(self, df):
+        """
+        Accepts a DataFrame, ensures models are loaded, and returns Risk Probability.
+        """
+        # 1. Preprocessing
+        X_val = df.fillna(-999)
+        
+        # 2. Lazy Loading (Initialize on first predict call if not ready)
+        if not self.models_loaded:
+            self.load_models(feature_count=X_val.shape[1])
+
+        # 3. TabNet Prediction
+        X_tensor = torch.tensor(X_val.values, dtype=torch.float32)
+        x_shared = X_tensor[:, :self.shared_dim]
+        x_private = X_tensor[:, self.shared_dim:]
+        
         with torch.no_grad():
-            # Convert to tensor and add batch dimension
-            x = torch.tensor(feature_vector, dtype=torch.float32).to(self.device)
-            if len(x.shape) == 1:
-                x = x.unsqueeze(0)
+            _, tabnet_prob = self.tabnet(x_shared, x_private)
+            tabnet_prob = tabnet_prob.numpy().flatten()
             
-            credit_prob, fraud_prob = self.model(x)
+        # 4. LightGBM Prediction & Ensemble
+        if self.lgbm:
+            lgbm_prob = self.lgbm.predict(X_val)
+            # Weighted Hybrid Score
+            final_prob = (0.4 * tabnet_prob) + (0.6 * lgbm_prob)
+        else:
+            final_prob = tabnet_prob
             
-        return credit_prob.item(), fraud_prob.item()
+        return final_prob
 
-    def decision_engine(self, credit_score, fraud_prob, fraud_threshold=0.8, credit_threshold=0.3):
-        """
-        The Logic Flow from your flowchart:
-        - High Fraud -> Auto Reject
-        - Low Fraud + Low Credit -> Auto Reject
-        - Low Fraud + High Credit -> Auto Approve
-        - Others -> Manual Review
-        """
-        if fraud_prob >= fraud_threshold:
-            return "🔴 AUTO-REJECT: High Fraud Risk"
-        
-        if fraud_prob < 0.2 and credit_score > (1 - credit_threshold):
-            return "🟢 AUTO-APPROVE: Low Risk Profile"
-        
-        if credit_score < 0.4:
-            return "🔴 AUTO-REJECT: High Credit Risk"
-            
-        return "🟡 MANUAL REVIEW: Ambiguous Case"
-
-# --- Example Usage Script ---
 if __name__ == "__main__":
-    # These params must match your training setup from 04/05.ipynb
-    INPUT_DIM = 446 
-    # Placeholder dims/idxs - in practice, import these from your config or saved metadata
+    # Example Usage
+    print("--- Testing Hybrid Inference Engine ---")
     
-    engine = RiskInferenceEngine(
-        model_path='../outputs/models/unified_mtl_best.pth',
-        input_dim=INPUT_DIM,
-        cat_dims=[], # Provide actual cat_dims here
-        cat_idxs=[]  # Provide actual cat_idxs here
-    )
-
-    # Simulate a single user transaction from your test set
-    test_data = pd.read_parquet('../data/processed/test_engineered.parquet').iloc[0]
-    features = test_data.drop(['TransactionID', 'TransactionDT']).values.astype(np.float32)
-    
-    c_score, f_prob = engine.predict_risk(features)
-    decision = engine.decision_engine(c_score, f_prob)
-    
-    print(f"\n--- Decision Report ---")
-    print(f"Credit Probability: {c_score:.4f}")
-    print(f"Fraud Probability:  {f_prob:.4f}")
-    print(f"Action: {decision}")
+    # Create a dummy row to test dimensions (based on your dataset size)
+    # This is just for testing the script execution
+    try:
+        # Load a tiny sample just to get columns/shape
+        sample_df = pd.read_parquet('../data/processed/train.parquet').iloc[:5]
+        sample_df = sample_df.drop(['isFraud', 'TransactionID', 'TransactionDT'], axis=1)
+        
+        engine = RiskInferenceEngine()
+        risk_scores = engine.predict(sample_df)
+        
+        print("\nTest Predictions:")
+        print(risk_scores)
+        print("\n✅ System is ready for production.")
+        
+    except Exception as e:
+        print(f"\n⚠️ Could not run test: {e}")
+        print("Ensure data is available in ../data/processed/")
