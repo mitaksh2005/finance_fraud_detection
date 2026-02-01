@@ -2,3 +2,4 @@
 *.parquet
 *.pth
 *.zip
+__pycache__/
