@@ -20,3 +20,8 @@ seaborn
 
 # Ensemble
 lightgbm
+
+# Deployment
+fastapi
+uvicorn
+streamlit

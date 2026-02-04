@@ -6,26 +6,27 @@ import pandas as pd
 import numpy as np
 import sys
 import os
-import joblib  # For loading the Meta-Learner
+import joblib
 
-# Add current directory to path so we can import 'model'
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# --- DYNAMIC PATH SETUP ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, '../outputs/models/')
+
+LGBM_PATH = os.path.join(MODELS_DIR, 'lgbm_baseline.txt')
+STD_TABNET_PATH = os.path.join(MODELS_DIR, 'tabnet_credit_baseline.zip')
+MTL_TABNET_PATH = os.path.join(MODELS_DIR, 'unified_mtl_best.pth')
+META_LEARNER_PATH = os.path.join(MODELS_DIR, 'meta_learner_logistic.pkl')
+
+DATA_PATH = os.path.join(BASE_DIR, '../data/processed/train.parquet')
+
+sys.path.append(BASE_DIR)
 from model import MultiTaskTabNet
 
-# --- Configuration (Must match Notebooks 04, 05, 06) ---
-LGBM_PATH = '../outputs/models/lgbm_baseline.txt'
-STD_TABNET_PATH = '../outputs/models/tabnet_credit_baseline.zip'
-MTL_TABNET_PATH = '../outputs/models/unified_mtl_best.pth'
-META_LEARNER_PATH = '../outputs/models/meta_learner_logistic.pkl'
-
 SHARED_DIM = 50
-DEVICE = torch.device('cpu')  # Inference is usually done on CPU
+DEVICE = torch.device('cpu')
 
 class RiskInferenceEngine:
     def __init__(self):
-        """
-        Initializes the Full Stacked Ensemble Engine.
-        """
         self.shared_dim = SHARED_DIM
         self.lgbm = None
         self.tabnet_std = None
@@ -34,71 +35,72 @@ class RiskInferenceEngine:
         self.models_loaded = False
 
     def load_models(self, feature_count):
-        """
-        Loads all 4 components: LightGBM, Std TabNet, MTL TabNet, and the Meta-Learner.
-        """
         print(f"⚡ Initializing Inference Engine with {feature_count} features...")
 
-        # 1. Load LightGBM (The Tree)
+        # 1. Load LightGBM
         if os.path.exists(LGBM_PATH):
             self.lgbm = lgb.Booster(model_file=LGBM_PATH)
-            print("✅ LightGBM loaded.")
         else:
-            raise FileNotFoundError(f"Missing LightGBM model at {LGBM_PATH}")
+            raise FileNotFoundError(f"Missing LightGBM at: {LGBM_PATH}")
 
-        # 2. Load Standard TabNet (The Neural Baseline)
+        # 2. Load Standard TabNet
         if os.path.exists(STD_TABNET_PATH):
             self.tabnet_std = TabNetClassifier()
             self.tabnet_std.load_model(STD_TABNET_PATH)
-            print("✅ Standard TabNet loaded.")
         else:
-            raise FileNotFoundError(f"Missing Std TabNet at {STD_TABNET_PATH}")
+            raise FileNotFoundError(f"Missing Std TabNet at: {STD_TABNET_PATH}")
 
-        # 3. Load Asymmetric MTL TabNet (The Custom Arch)
-        # We calculate dimensions dynamically based on input features
+        # 3. Load Asymmetric MTL
         input_dim = self.shared_dim
         private_dim = feature_count - self.shared_dim
-        
         try:
             self.tabnet_mtl = MultiTaskTabNet(input_dim=input_dim, private_dim=private_dim)
             self.tabnet_mtl.load_state_dict(torch.load(MTL_TABNET_PATH, map_location=DEVICE))
             self.tabnet_mtl.eval()
-            print("✅ Asymmetric MTL TabNet loaded.")
         except FileNotFoundError:
-            raise FileNotFoundError(f"Missing MTL Model at {MTL_TABNET_PATH}")
+            raise FileNotFoundError(f"Missing MTL Model at: {MTL_TABNET_PATH}")
 
-        # 4. Load Meta-Learner (The Stacker)
+        # 4. Load Meta-Learner
         if os.path.exists(META_LEARNER_PATH):
             self.meta_learner = joblib.load(META_LEARNER_PATH)
-            print("✅ Meta-Learner (Logistic Regression) loaded.")
         else:
-            raise FileNotFoundError(f"Missing Meta-Learner at {META_LEARNER_PATH}")
+            raise FileNotFoundError(f"Missing Meta-Learner at: {META_LEARNER_PATH}")
 
         self.models_loaded = True
 
     def predict(self, df):
         """
-        Runs the full Stacked Ensemble pipeline on new data.
-        Returns: Numpy array of Fraud Probabilities (0.0 to 1.0)
+        Runs the full Stacked Ensemble pipeline.
         """
-        # 1. Preprocessing (Fill NaNs)
-        # Ensure we use the exact same fill value (-999) as training
-        X_val = df.fillna(-999)
-        
-        # 2. Lazy Loading
+        # --- 1. PREPROCESSING FOR LIGHTGBM (Tree) ---
+        # Trees handle -999 natively and effectively
+        X_tree = df.fillna(-999)
+
+        # --- 2. PREPROCESSING FOR NEURAL NETS (TabNet) ---
+        # Convert to numpy and ensure we are working with float32
+        X_neural_np = df.fillna(0).values.astype(np.float32)
+
+        # 3. Lazy Loading
         if not self.models_loaded:
-            self.load_models(feature_count=X_val.shape[1])
+            self.load_models(feature_count=df.shape[1])
+
+        # --- CRITICAL FIX: SAFETY CLIP FOR EMBEDDINGS ---
+        # We loop through every categorical column known to the model
+        # and ensure values are >= 0 and < vocabulary size.
+        if hasattr(self.tabnet_std, 'cat_idxs') and hasattr(self.tabnet_std, 'cat_dims'):
+            for idx, dim in zip(self.tabnet_std.cat_idxs, self.tabnet_std.cat_dims):
+                # Clip values to be safe [0, dim-1]
+                # This turns -1 into 0, and any huge outliers into the max valid index
+                X_neural_np[:, idx] = np.clip(X_neural_np[:, idx], 0, dim - 1)
 
         # --- STEP A: LightGBM Prediction ---
-        pred_lgbm = self.lgbm.predict(X_val)
+        pred_lgbm = self.lgbm.predict(X_tree)
 
         # --- STEP B: Standard TabNet Prediction ---
-        # TabNet outputs [Prob_0, Prob_1], we want column 1
-        pred_tabnet_std = self.tabnet_std.predict_proba(X_val.values)[:, 1]
+        pred_tabnet_std = self.tabnet_std.predict_proba(X_neural_np)[:, 1]
 
         # --- STEP C: Asymmetric MTL Prediction ---
-        # Convert to Tensor and split for the two-lane architecture
-        X_tensor = torch.tensor(X_val.values, dtype=torch.float32)
+        X_tensor = torch.tensor(X_neural_np, dtype=torch.float32)
         x_shared = X_tensor[:, :self.shared_dim]
         x_private = X_tensor[:, self.shared_dim:]
         
@@ -106,32 +108,27 @@ class RiskInferenceEngine:
             _, pred_mtl = self.tabnet_mtl(x_shared, x_private)
         pred_mtl = pred_mtl.numpy().flatten()
 
-        # --- STEP D: Stacking (The Meta-Learner) ---
-        # Stack predictions: [LightGBM, Std_TabNet, MTL]
-        # This matches the training order in Notebook 06
+        # --- STEP D: Stacking ---
         X_stack = np.column_stack((pred_lgbm, pred_tabnet_std, pred_mtl))
-        
-        # Final Probability from the Judge
         final_prob = self.meta_learner.predict_proba(X_stack)[:, 1]
 
         return final_prob
 
 if __name__ == "__main__":
-    # Test Run
     print("--- Testing Production Inference ---")
-    
     try:
-        # Load a tiny sample from processed data
-        sample_df = pd.read_parquet('../data/processed/train.parquet').iloc[:5]
+        if not os.path.exists(DATA_PATH):
+            raise FileNotFoundError(f"Training data not found at {DATA_PATH}")
+
+        # Load sample
+        sample_df = pd.read_parquet(DATA_PATH).iloc[:5]
         sample_df = sample_df.drop(['isFraud', 'TransactionID', 'TransactionDT'], axis=1)
         
         engine = RiskInferenceEngine()
         risk_scores = engine.predict(sample_df)
         
-        print("\nRisk Scores for 5 Sample Transactions:")
-        print(risk_scores)
+        print("\nRisk Scores:", risk_scores)
         print("\n✅ SYSTEM ONLINE.")
         
     except Exception as e:
         print(f"\n❌ Test Failed: {e}")
-        print("Did you run Notebooks 04, 05, and 06 to generate all models?")
