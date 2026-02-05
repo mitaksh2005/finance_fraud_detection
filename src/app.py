@@ -33,16 +33,28 @@ st.markdown("""
     .block-container { padding-top: 2rem; padding-bottom: 2rem; }
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+    
+    /* Metrics Styling */
     div[data-testid="stMetric"] {
         background-color: #f8f9fa05;
         border: 1px solid #e6e6e620;
         padding: 15px;
         border-radius: 8px;
     }
+    
+    /* Buttons */
     .stButton button {
         height: 3rem;
         border-radius: 8px;
         font-weight: 600;
+    }
+    
+    /* Review Box Highlight */
+    .review-box {
+        border: 1px solid #ffc107;
+        padding: 20px;
+        border-radius: 10px;
+        background-color: #fff3cd05;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -142,51 +154,74 @@ if uploaded_file:
 if st.session_state.batch_results is not None:
     res_df = st.session_state.batch_results
     
-    # 1. High Level Metrics
+    # 1. High Level Metrics & Download
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Scanned", len(res_df))
     c2.metric("Blocked (>80%)", len(res_df[res_df['Verdict'] == 'BLOCK']))
     
-    # HIGHLIGHT THE REVIEW QUEUE
     review_count = len(res_df[res_df['Verdict'] == 'REVIEW'])
     c3.metric("Review Queue (50-80%)", review_count, delta="Action Required" if review_count > 0 else None, delta_color="inverse")
-    
     c4.metric("Approved (<50%)", len(res_df[res_df['Verdict'] == 'APPROVE']))
+    
+    # --- DOWNLOAD BUTTON ---
+    col_dl_1, col_dl_2 = st.columns([6, 1])
+    with col_dl_2:
+        csv = res_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Report",
+            data=csv,
+            file_name="fraud_risk_report.csv",
+            mime="text/csv",
+            type="secondary"
+        )
     
     st.write("")
 
-    # --- REVIEW QUEUE SECTION ---
+    # --- ENHANCED REVIEW QUEUE ---
     if review_count > 0:
-        st.info(f"⚠️ **Action Required:** There are {review_count} transactions flagged for Manual Review.")
-        
-        # Filter just the review items
-        review_df = res_df[res_df['Verdict'] == 'REVIEW']
-        
-        col_q_list, col_q_act = st.columns([2, 1])
-        
-        with col_q_list:
-            st.dataframe(review_df.style.background_gradient(subset=['Risk_Score'], cmap='Oranges'), use_container_width=True, height=200)
+        with st.container():
+            st.markdown("### ⚠️ Manual Review Queue")
+            st.info(f"There are {review_count} transactions in the gray zone (50-80% risk). Please adjudicate.")
             
-        with col_q_act:
-            st.markdown("#### Review Decision")
-            review_id = st.selectbox("Select ID to Review", review_df['TransactionID'].unique())
+            review_df = res_df[res_df['Verdict'] == 'REVIEW']
             
-            # Get score for this ID
-            curr_score = review_df[review_df['TransactionID'] == review_id]['Risk_Score'].values[0]
-            st.write(f"Risk Score: **{curr_score:.2%}**")
+            # Split into List and Decision Box
+            col_list, col_decision = st.columns([3, 2])
             
-            b1, b2 = st.columns(2)
-            if b1.button("✅ Mark Safe", use_container_width=True):
-                # Update Session State
-                idx = st.session_state.batch_results[st.session_state.batch_results['TransactionID'] == review_id].index
-                st.session_state.batch_results.loc[idx, 'Verdict'] = 'APPROVE'
-                st.rerun()
+            with col_list:
+                st.dataframe(
+                    review_df[['TransactionID', 'Risk_Score']].style.background_gradient(subset=['Risk_Score'], cmap='Oranges'),
+                    use_container_width=True, 
+                    height=250
+                )
+            
+            with col_decision:
+                # Decision Box Logic
+                st.markdown('<div class="review-box">', unsafe_allow_html=True)
+                st.subheader("Review Console")
                 
-            if b2.button("⛔ Block", type="primary", use_container_width=True):
-                # Update Session State
-                idx = st.session_state.batch_results[st.session_state.batch_results['TransactionID'] == review_id].index
-                st.session_state.batch_results.loc[idx, 'Verdict'] = 'BLOCK'
-                st.rerun()
+                # Dynamic Select Box (Auto-selects top risk)
+                top_risk_id = review_df.sort_values('Risk_Score', ascending=False).iloc[0]['TransactionID']
+                review_id = st.selectbox("Select Transaction ID", review_df['TransactionID'].unique(), index=0)
+                
+                # Show details for selected ID
+                curr_score = review_df[review_df['TransactionID'] == review_id]['Risk_Score'].values[0]
+                st.metric("Risk Score", f"{curr_score:.2%}")
+                
+                # Action Buttons
+                btn_col1, btn_col2 = st.columns(2)
+                if btn_col1.button("✅ Mark Safe", use_container_width=True):
+                    idx = st.session_state.batch_results[st.session_state.batch_results['TransactionID'] == review_id].index
+                    st.session_state.batch_results.loc[idx, 'Verdict'] = 'APPROVE'
+                    st.toast(f"Transaction {review_id} Approved!", icon="✅")
+                    st.rerun()
+                    
+                if btn_col2.button("⛔ Mark Fraud", type="primary", use_container_width=True):
+                    idx = st.session_state.batch_results[st.session_state.batch_results['TransactionID'] == review_id].index
+                    st.session_state.batch_results.loc[idx, 'Verdict'] = 'BLOCK'
+                    st.toast(f"Transaction {review_id} Blocked!", icon="⛔")
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
                 
         st.divider()
 
@@ -213,6 +248,11 @@ if st.session_state.batch_results is not None:
         row_data = st.session_state.batch_data[st.session_state.batch_data['TransactionID'] == search_id]
         selected_row = row_data.drop(['TransactionID'], axis=1) 
         prob = res_df[res_df['TransactionID'] == search_id]['Risk_Score'].values[0]
+        
+        # --- NEW: RAW DATA DISPLAY ---
+        with st.expander("📄 View Full Raw Data Row", expanded=True):
+            st.dataframe(row_data, use_container_width=True)
+        # -----------------------------
         
         st.write("")
         left, right = st.columns([1, 2], gap="large")
